@@ -1,6 +1,6 @@
-dataset: cifar100
+dataset: cifar10
 net_type: resnet
-depth: 34
+depth: 50
 
 epochs: 200
 batch_size: 64
@@ -9,7 +9,7 @@ momentum: 0.9
 weight_decay: 0.0005
 schedule_steps: [100, 150]
 
-experiment_name: cifar100_resnet34
+experiment_name: cifar10_resnet50
 
 cutmix:
   beta: 1.0

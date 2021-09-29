@@ -85,7 +85,7 @@ def main():
 
     log_path = os.path.join(model_save_folder, "train_metrics.txt")
     logger = Logger(log_path, resume=os.path.isfile(log_path))
-    logger.set_names(["epoch", "lr", "train_loss", "top1_train", "test_loss", "top1", "top5"])
+    logger.set_names(["epoch", "lr", "train_loss", "top1_train", "top1_corr", "test_loss", "top1", "top5"])
 
     if args.dataset.startswith('cifar'):
         normalize = transforms.Normalize(
@@ -206,10 +206,10 @@ def main():
     for epoch in range(0, args.epochs):
 
         # train for one epoch
-        top1_train, _, train_loss = run_epoch(train_loader, model, criterion, optimizer, epoch, 'train')
+        top1_train, _, train_loss, top1_corr = run_epoch(train_loader, model, criterion, optimizer, epoch, 'train')
 
         # evaluate on test set
-        top1, top5, val_loss = run_epoch(val_loader, model, criterion, None, epoch, 'test')
+        top1, top5, val_loss, _ = run_epoch(val_loader, model, criterion, None, epoch, 'test')
 
         # remember best prec@1 and save checkpoint
         is_best = top1 > best_acc1
@@ -229,7 +229,7 @@ def main():
 
         scheduler.step()
 
-        logger.append([epoch, get_learning_rate(optimizer), train_loss, top1_train, val_loss, top1, top5])
+        logger.append([epoch, get_learning_rate(optimizer), train_loss, top1_train, top1_corr, val_loss, top1, top5])
         logging.info("epoch {} end stats: train_loss : {:.5f} | test_loss : {:.5f} | top1 : {:.5f} | top5 : {:.5f}".format(epoch, train_loss, val_loss, top1, top5))
 
     logging.info('Best(top-1 and 5): {:.5f} and {:.5f}'.format(best_acc1, best_acc5))
@@ -285,9 +285,9 @@ def run_epoch(loader, model, criterion, optimizer, epoch, tag):
 
         if len(target.shape) == 1:
             if tag == "train":
-                err1 = accuracy(output.data, target, topk=(1,))
+                err1, = accuracy(output.data, target, topk=(1,))
                 top1.update(err1.item(), input.size(0))
-                err1 = accuracy(output_corr.data, corr_target, topk=(1,))
+                err1, = accuracy(output_corr.data, corr_target, topk=(1,))
                 top1_corr.update(err1.item(), input.size(0))
             else:
                 err1, err5 = accuracy(output.data, target, topk=(1, 5))
@@ -307,9 +307,9 @@ def run_epoch(loader, model, criterion, optimizer, epoch, tag):
         if tag == "train":
             loader.set_postfix_str("loss: {:.5f} | train_top1: {:.5f} | train_top1_corr : {:.5f}".format(losses.avg, top1.avg, top1_corr.avg))
         else:
-            loader.set_postfix_str("loss: {:.5f} | err1: {:.5f} | err5: {:.5f}".format(losses.avg, top1.avg, top5.avg))
+            loader.set_postfix_str("loss: {:.5f} | top1: {:.5f} | top5: {:.5f}".format(losses.avg, top1.avg, top5.avg))
 
-    return top1.avg, top5.avg, losses.avg
+    return top1.avg, top5.avg, losses.avg, top1_corr.avg
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth'):
