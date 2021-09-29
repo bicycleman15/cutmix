@@ -87,7 +87,7 @@ class ResNet(nn.Module):
         self.dataset = dataset
         if self.dataset.startswith('cifar'):
             self.inplanes = 16
-            print(bottleneck)
+            # print(bottleneck)
             if bottleneck == True:
                 n = int((depth - 2) / 9)
                 block = Bottleneck

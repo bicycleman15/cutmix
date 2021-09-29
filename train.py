@@ -1,8 +1,13 @@
 # original code: https://github.com/dyhan0920/PyramidNet-PyTorch/blob/master/train.py
 
+import logging
 import os
 import shutil
 import time
+from cv2 import transform
+from numpy import mod
+import pandas as pd
+# import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -17,7 +22,8 @@ import torchvision.models as models
 from sklearn.model_selection._split import StratifiedShuffleSplit
 from theconf.argument_parser import ConfigArgumentParser
 from torch.utils.data.dataset import Subset
-from tqdm._tqdm import tqdm
+from torchvision.transforms.transforms import RandomRotation, RandomVerticalFlip
+from tqdm import tqdm
 
 from network import resnet as RN
 import network.pyramidnet as PYRM
@@ -26,9 +32,6 @@ import utils
 import warnings
 
 from cutmix.cutmix import CutMix
-from cutmix.utils import CutMixCrossEntropyLoss
-from autoaug.archive import fa_reduced_cifar10, fa_reduced_imagenet, autoaug_paper_cifar10, autoaug_policy
-from autoaug.augmentations import Augmentation
 
 warnings.filterwarnings("ignore")
 
@@ -40,8 +43,8 @@ parser = ConfigArgumentParser(conflict_handler='resolve')
 parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--expname', default='TEST', type=str, help='name of experiment')
-parser.add_argument('--cifarpath', default='/data/private/pretrainedmodels/', type=str)
-parser.add_argument('--imagenetpath', default='/data/private/pretrainedmodels/imagenet/', type=str)
+parser.add_argument('--cifarpath', default='../data', type=str)
+parser.add_argument('--imagenetpath', default="/home/jatin/Imagenet/ILSVRC/Data/CLS-LOC", type=str)
 parser.add_argument('--autoaug', default='', type=str)
 parser.add_argument('--cv', default=-1, type=int)
 parser.add_argument('--only-eval', action='store_true')
@@ -50,13 +53,39 @@ parser.add_argument('--checkpoint', default='', type=str)
 parser.set_defaults(bottleneck=True)
 parser.set_defaults(verbose=True)
 
-best_err1 = 100
-best_err5 = 100
+from time import localtime, strftime
+import errno
+from util.logger import Logger
 
+def mkdir_p(path):
+    '''make dir if not exist'''
+    try:
+        os.makedirs(path)
+    except OSError as exc:  # Python >2.5
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
 
 def main():
-    global args, best_err1, best_err5
+    global args
     args = parser.parse_args()
+
+    # create model save path
+    current_time = strftime("%d-%b", localtime())
+    model_save_folder = f"checkpoints/{current_time}_{args.experiment_name}"
+    mkdir_p(model_save_folder)
+    logging.basicConfig(level=logging.INFO, 
+                        # format="%(levelname)s:  %(message)s",
+                        handlers=[
+                            logging.FileHandler(filename=os.path.join(model_save_folder, "train.log")),
+                            logging.StreamHandler()
+                        ])
+    logging.info(f"Creating model save path: {model_save_folder}")
+
+    log_path = os.path.join(model_save_folder, "train_metrics.txt")
+    logger = Logger(log_path, resume=os.path.isfile(log_path))
+    logger.set_names(["epoch", "lr", "train_loss", "top1_train", "test_loss", "top1", "top5"])
 
     if args.dataset.startswith('cifar'):
         normalize = transforms.Normalize(
@@ -64,28 +93,17 @@ def main():
             std=[x / 255.0 for x in [63.0, 62.1, 66.7]]
         )
 
-        transform_train = transforms.Compose([
+        transform_pre_cnc = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
         ])
 
-        autoaug = args.autoaug
-        if autoaug:
-            print('augmentation: %s' % autoaug)
-            if autoaug == 'fa_reduced_cifar10':
-                transform_train.transforms.insert(0, Augmentation(fa_reduced_cifar10()))
-            elif autoaug == 'fa_reduced_imagenet':
-                transform_train.transforms.insert(0, Augmentation(fa_reduced_imagenet()))
-            elif autoaug == 'autoaug_cifar10':
-                transform_train.transforms.insert(0, Augmentation(autoaug_paper_cifar10()))
-            elif autoaug == 'autoaug_extend':
-                transform_train.transforms.insert(0, Augmentation(autoaug_policy()))
-            elif autoaug in ['default', 'inception', 'inception320']:
-                pass
-            else:
-                raise ValueError('not found augmentations. %s' % C.get()['aug'])
+        transform_post_cnc = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ToTensor(),
+            normalize
+        ])
 
         transform_test = transforms.Compose([
             transforms.ToTensor(),
@@ -93,47 +111,26 @@ def main():
         ])
 
         if args.dataset == 'cifar100':
-            ds_train = datasets.CIFAR100(args.cifarpath, train=True, download=True, transform=transform_train)
-            if args.cv >= 0:
-                sss = StratifiedShuffleSplit(n_splits=5, test_size=0.2, random_state=0)
-                sss = sss.split(list(range(len(ds_train))), ds_train.targets)
-                for _ in range(args.cv + 1):
-                    train_idx, valid_idx = next(sss)
-                ds_valid = Subset(ds_train, valid_idx)
-                ds_train = Subset(ds_train, train_idx)
-            else:
-                ds_valid = Subset(ds_train, [])
+            ds_train = datasets.CIFAR100(args.cifarpath, train=True, download=True, transform=transform_pre_cnc)
             ds_test = datasets.CIFAR100(args.cifarpath, train=False, transform=transform_test)
 
             train_loader = torch.utils.data.DataLoader(
-                CutMix(ds_train, 100, beta=args.cutmix_beta, prob=args.cutmix_prob, num_mix=args.cutmix_num),
+                CutMix(ds_train, 100, beta=args.cutmix_beta, prob=args.cutmix_prob, num_mix=args.cutmix_num, transform=(transform_test, transform_post_cnc)),
                 batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
-            tval_loader = torch.utils.data.DataLoader(ds_valid,
-                 batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             val_loader = torch.utils.data.DataLoader(ds_test,
                 batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             numberofclass = 100
         elif args.dataset == 'cifar10':
-            ds_train = datasets.CIFAR10(args.cifarpath, train=True, download=True, transform=transform_train)
-            if args.cv >= 0:
-                sss = StratifiedShuffleSplit(n_splits=5, test_size=0.2, random_state=0)
-                sss = sss.split(list(range(len(ds_train))), ds_train.targets)
-                for _ in range(args.cv + 1):
-                    train_idx, valid_idx = next(sss)
-                ds_valid = Subset(ds_train, valid_idx)
-                ds_train = Subset(ds_train, train_idx)
-            else:
-                ds_valid = Subset(ds_train, [])
+            ds_train = datasets.CIFAR10(args.cifarpath, train=True, download=True, transform=transform_pre_cnc)
 
             train_loader = torch.utils.data.DataLoader(
                 CutMix(ds_train, 10,
-                beta=args.cutmix_beta, prob=args.cutmix_prob, num_mix=args.cutmix_num),
+                beta=args.cutmix_beta, prob=args.cutmix_prob, num_mix=args.cutmix_num, transform=(transform_test, transform_post_cnc)),
                 batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
-            tval_loader = torch.utils.data.DataLoader(ds_valid,
-                batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             val_loader = torch.utils.data.DataLoader(
                 datasets.CIFAR10(args.cifarpath, train=False, transform=transform_test),
                 batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+
             numberofclass = 10
         else:
             raise Exception('unknown dataset: {}'.format(args.dataset))
@@ -141,6 +138,7 @@ def main():
     elif args.dataset == 'imagenet':
         traindir = os.path.join(args.imagenetpath, 'train')
         valdir = os.path.join(args.imagenetpath, 'val')
+
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
 
@@ -151,51 +149,25 @@ def main():
                                           [-0.5808, -0.0045, -0.8140],
                                           [-0.5836, -0.6948, 0.4203]])
 
-        transform_train = transforms.Compose([
+        transform_pre_cnc = transforms.Compose([
             transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+            transforms.RandomHorizontalFlip()
+        ])
+
+        transform_post_cnc = transforms.Compose([
             transforms.ToTensor(),
             jittering,
             lighting,
-            normalize,
+            normalize
         ])
 
-        autoaug = args.autoaug
-        if autoaug:
-            print('augmentation: %s' % autoaug)
-            if autoaug == 'fa_reduced_cifar10':
-                transform_train.transforms.insert(0, Augmentation(fa_reduced_cifar10()))
-            elif autoaug == 'fa_reduced_imagenet':
-                transform_train.transforms.insert(0, Augmentation(fa_reduced_imagenet()))
-
-            elif autoaug == 'autoaug_cifar10':
-                transform_train.transforms.insert(0, Augmentation(autoaug_paper_cifar10()))
-            elif autoaug == 'autoaug_extend':
-                transform_train.transforms.insert(0, Augmentation(autoaug_policy()))
-            elif autoaug in ['default', 'inception', 'inception320']:
-                pass
-            else:
-                raise ValueError('not found augmentations. %s' % C.get()['aug'])
-
-        train_dataset = datasets.ImageFolder(traindir, transform_train)
-        if args.cv >= 0:
-            sss = StratifiedShuffleSplit(n_splits=5, test_size=0.2, random_state=0)
-            sss = sss.split(list(range(len(train_dataset))), train_dataset.targets)
-            for _ in range(args.cv + 1):
-                train_idx, valid_idx = next(sss)
-            valid_dataset = Subset(train_dataset, valid_idx)
-            train_dataset = Subset(train_dataset, train_idx)
-        else:
-            valid_dataset = Subset(train_dataset, [])
-
-        train_dataset = CutMix(train_dataset, 1000, beta=args.cutmix_beta, prob=args.cutmix_prob, num_mix=args.cutmix_num)
-        train_sampler = None
+        train_dataset = datasets.ImageFolder(traindir, transform=transform_pre_cnc)
+        train_dataset = CutMix(train_dataset, 1000, beta=args.cutmix_beta, prob=args.cutmix_prob, num_mix=args.cutmix_num, transform=transform_post_cnc)
 
         train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-        tval_loader = torch.utils.data.DataLoader(valid_dataset,
-              batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True)
+
         val_loader = torch.utils.data.DataLoader(
             datasets.ImageFolder(valdir, transforms.Compose([
                 transforms.Resize(256),
@@ -205,127 +177,146 @@ def main():
             ])),
             batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True)
+
         numberofclass = 1000
     else:
         raise Exception('unknown dataset: {}'.format(args.dataset))
 
-    print("=> creating model '{}'".format(args.net_type))
+    logging.info("Creating model {}-{}".format(args.net_type, args.depth))
     if args.net_type == 'resnet':
-        model = RN.ResNet(args.dataset, args.depth, numberofclass, True)
-    elif args.net_type == 'pyramidnet':
-        model = PYRM.PyramidNet(args.dataset, args.depth, args.alpha, numberofclass, True)
-    elif 'wresnet' in args.net_type:
-        model = WRN(args.depth, args.alpha, dropout_rate=0.0, num_classes=numberofclass)
+        model = RN.ResNet(args.dataset, args.depth, numberofclass+1, True)
     else:
         raise ValueError('unknown network architecture: {}'.format(args.net_type))
 
-    model = torch.nn.DataParallel(model).cuda()
-    print('the number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
+    model = model.cuda()
 
     # define loss function (criterion) and optimizer
-    criterion = CutMixCrossEntropyLoss(True)
+    criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=1e-4, nesterov=True)
+
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule_steps)
+
     cudnn.benchmark = True
 
+    best_acc1 = 0.
+    best_acc5 = 0.
+
     for epoch in range(0, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
-        model.train()
-        err1, err5, train_loss = run_epoch(train_loader, model, criterion, optimizer, epoch, 'train')
-        train_err1 = err1
-        err1, err5, train_loss = run_epoch(tval_loader, model, criterion, None, epoch, 'train-val')
+        top1_train, _, train_loss = run_epoch(train_loader, model, criterion, optimizer, epoch, 'train')
 
-        # evaluate on validation set
-        model.eval()
-        err1, err5, val_loss = run_epoch(val_loader, model, criterion, None, epoch, 'valid')
+        # evaluate on test set
+        top1, top5, val_loss = run_epoch(val_loader, model, criterion, None, epoch, 'test')
 
         # remember best prec@1 and save checkpoint
-        is_best = err1 <= best_err1
-        best_err1 = min(err1, best_err1)
+        is_best = top1 > best_acc1
+        best_acc1 = max(top1, best_acc1)
         if is_best:
-            best_err5 = err5
-            print('Current Best (top-1 and 5 error):', best_err1, best_err5)
+            best_acc5 = top5
+            logging.info('New best (top-1 and 5) obtained: {:.5f} and {:.5f}'.format(best_acc1, best_acc5))
 
         save_checkpoint({
             'epoch': epoch,
             'arch': args.net_type,
             'state_dict': model.state_dict(),
-            'best_err1': best_err1,
-            'best_err5': best_err5,
+            'best_acc1': best_acc1,
+            'best_acc5': best_acc5,
             'optimizer': optimizer.state_dict(),
-        }, is_best, filename='checkpoint_e%d_top1_%.3f_%.3f.pth' % (epoch, train_err1, err1))
+        }, is_best, checkpoint=model_save_folder, filename="checkpoint.pth")
 
-    print('Best(top-1 and 5 error):', best_err1, best_err5)
+        scheduler.step()
+
+        logger.append([epoch, get_learning_rate(optimizer), train_loss, top1_train, val_loss, top1, top5])
+        logging.info("epoch {} end stats: train_loss : {:.5f} | test_loss : {:.5f} | top1 : {:.5f} | top5 : {:.5f}".format(epoch, train_loss, val_loss, top1, top5))
+
+    logging.info('Best(top-1 and 5): {:.5f} and {:.5f}'.format(best_acc1, best_acc5))
+    logger.close()
 
 
 def run_epoch(loader, model, criterion, optimizer, epoch, tag):
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
+    # batch_time = AverageMeter()
+    # data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+    top1_corr = AverageMeter()
+
+    if tag == "train":
+        model.train()
+    else:
+        model.eval()
 
     end = time.time()
+
     if optimizer:
-        current_lr = get_learning_rate(optimizer)[0]
-    else:
-        current_lr = None
+        current_lr = get_learning_rate(optimizer)
+    else: 
+        current_lr = 0.
 
-    tqdm_disable = bool(os.environ.get('TASK_NAME', ''))  # for KakaoBrain
-    loader = tqdm(loader, disable=tqdm_disable)
-    loader.set_description('[%s %04d/%04d]' % (tag, epoch, args.epochs))
+    logging.info("{} : epoch {}/{} with lr : {:.5f}".format(tag, epoch, args.epochs, current_lr))
+    loader = tqdm(loader)
 
-    for i, (input, target) in enumerate(loader):
+    for i, data in enumerate(loader):
         # measure data loading time
-        data_time.update(time.time() - end)
+        # data_time.update(time.time() - end)
 
-        input, target = input.cuda(), target.cuda()
+        if tag == "train":
+            input, target, corrupted_img, corr_target = data
+            input, target, corrupted_img, corr_target = input.cuda(), target.cuda(), corrupted_img.cuda(), corr_target.cuda()
+        else:
+            input, target = data
+            input, target = input.cuda(), target.cuda()
 
-        output = model(input)
-        loss = criterion(output, target)
+        if tag == "train":
+            output = model(input)
+            output_corr = model(corrupted_img)
+            loss = criterion(output, target) + criterion(output_corr, corr_target)
+
+        else:
+            with torch.no_grad():
+                output = model(input)
+                loss = criterion(output, target)
 
         # measure accuracy and record loss
         losses.update(loss.item(), input.size(0))
 
-        if len(target.size()) == 1:
-            err1, err5 = accuracy(output.data, target, topk=(1, 5))
-            top1.update(err1.item(), input.size(0))
-            top5.update(err5.item(), input.size(0))
+        if len(target.shape) == 1:
+            if tag == "train":
+                err1 = accuracy(output.data, target, topk=(1,))
+                top1.update(err1.item(), input.size(0))
+                err1 = accuracy(output_corr.data, corr_target, topk=(1,))
+                top1_corr.update(err1.item(), input.size(0))
+            else:
+                err1, err5 = accuracy(output.data, target, topk=(1, 5))
+                top1.update(err1.item(), input.size(0))
+                top5.update(err5.item(), input.size(0))
 
         if optimizer:
             # compute gradient and do SGD step
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        else:
-            del loss, output
 
         # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+        # batch_time.update(time.time() - end)
+        # end = time.time()
 
-        loader.set_postfix(lr=current_lr, batch_time=batch_time.avg, data_time=data_time.avg, loss=losses.avg, top1=top1.avg, top5=top5.avg)
-
-    if tqdm_disable:
-        print('[%s %03d/%03d] %s' % (tag, epoch, args.epochs, dict(lr=current_lr, batch_time=batch_time.avg, data_time=data_time.avg, loss=losses.avg, top1=top1.avg, top5=top5.avg)))
+        if tag == "train":
+            loader.set_postfix_str("loss: {:.5f} | train_top1: {:.5f} | train_top1_corr : {:.5f}".format(losses.avg, top1.avg, top1_corr.avg))
+        else:
+            loader.set_postfix_str("loss: {:.5f} | err1: {:.5f} | err5: {:.5f}".format(losses.avg, top1.avg, top5.avg))
 
     return top1.avg, top5.avg, losses.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    if not args.expname:
-        return
-
-    directory = "runs/%s/" % args.expname
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    filename = directory + filename
-    torch.save(state, filename)
+def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth'):
+    filepath = os.path.join(checkpoint, filename)
+    torch.save(state, filepath)
     if is_best:
-        shutil.copyfile(filename, os.path.join('runs', args.expname, 'model_best.pth'))
+        shutil.copyfile(filepath, os.path.join(checkpoint, f"model_best.pth"))
 
 
 class AverageMeter(object):
@@ -347,31 +338,13 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    if args.dataset.startswith('cifar'):
-        lr = args.lr * (0.1 ** (epoch // (args.epochs * 0.5))) * (0.1 ** (epoch // (args.epochs * 0.75)))
-    elif args.dataset == 'imagenet':
-        if args.epochs == 300:
-            lr = args.lr * (0.1 ** (epoch // 75))
-        else:
-            lr = args.lr * (0.1 ** (epoch // 30))
-    else:
-        raise ValueError(args.dataset)
-
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
 def get_learning_rate(optimizer):
-    lr = []
     for param_group in optimizer.param_groups:
-        lr += [param_group['lr']]
-    return lr
-
+        return param_group['lr']
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
+
     maxk = max(topk)
     batch_size = target.size(0)
 
@@ -381,9 +354,8 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-        wrong_k = batch_size - correct_k
-        res.append(wrong_k.mul_(100.0 / batch_size))
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+        res.append(correct_k.mul_(100.0 / batch_size))
 
     return res
 

@@ -47,11 +47,11 @@ def onehot(size, target):
 
 def rand_bbox(size, lam):
     if len(size) == 4:
-        W = size[2]
-        H = size[3]
-    elif len(size) == 3:
         W = size[1]
         H = size[2]
+    elif len(size) == 3:
+        W = size[0]
+        H = size[1]
     else:
         raise Exception
 

@@ -9,6 +9,8 @@ momentum: 0.9
 
 weight_decay: 0.0001
 
+experiment_name: imagenet_resnet
+
 cutmix:
   beta: 1.0
   prob: 1.0

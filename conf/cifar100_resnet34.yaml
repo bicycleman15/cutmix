@@ -1,15 +1,15 @@
-dataset: imagenet
+dataset: cifar100
 net_type: resnet
 depth: 34
 
-epochs: 300
-batch_size: 256
+epochs: 200
+batch_size: 64
 lr: 0.1
 momentum: 0.9
-
 weight_decay: 0.0001
+schedule_steps: [100, 150]
 
-experiment_name: imagenet_resnet
+experiment_name: cifar100_resnet34
 
 cutmix:
   beta: 1.0
